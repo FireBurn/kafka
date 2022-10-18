@@ -899,7 +899,7 @@ class KafkaController(val config: KafkaConfig,
 
   private def initializeControllerContext(): Unit = {
     // update controller cache with delete topic information
-    val curBrokerAndEpochs = zkClient.getAllBrokerAndEpochsInCluster
+    val curBrokerAndEpochs = zkClient.getAllBrokerAndEpochsInCluster()
     val (compatibleBrokerAndEpochs, incompatibleBrokerAndEpochs) = partitionOnFeatureCompatibility(curBrokerAndEpochs)
     if (incompatibleBrokerAndEpochs.nonEmpty) {
       warn("Ignoring registration of new brokers due to incompatibilities with finalized features: " +
@@ -1559,7 +1559,7 @@ class KafkaController(val config: KafkaConfig,
 
   private def processBrokerChange(): Unit = {
     if (!isActive) return
-    val curBrokerAndEpochs = zkClient.getAllBrokerAndEpochsInCluster
+    val curBrokerAndEpochs = zkClient.getAllBrokerAndEpochsInCluster()
     val curBrokerIdAndEpochs = curBrokerAndEpochs map { case (broker, epoch) => (broker.id, epoch) }
     val curBrokerIds = curBrokerIdAndEpochs.keySet
     val liveOrShuttingDownBrokerIds = controllerContext.liveOrShuttingDownBrokerIds

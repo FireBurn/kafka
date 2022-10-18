@@ -105,7 +105,7 @@ class KafkaZkClient private[zk] (zooKeeperClient: ZooKeeperClient, isSecure: Boo
    * @return the (updated controller epoch, epoch zkVersion) tuple
    * @throws ControllerMovedException if fail to create /controller or fail to increment controller epoch.
    */
-  def registerControllerAndIncrementControllerEpoch(controllerId: Int): (Int, Int) = {
+  def registerControllerAndIncrementControllerEpoch(controllerId: Int, force: Boolean = false): (Int, Int) = {
     val timestamp = time.milliseconds()
 
     // Read /controller_epoch to get the current controller epoch and zkVersion,
@@ -139,15 +139,24 @@ class KafkaZkClient private[zk] (zooKeeperClient: ZooKeeperClient, isSecure: Boo
     }
 
     def tryCreateControllerZNodeAndIncrementEpoch(): (Int, Int) = {
-      val response = retryRequestUntilConnected(
-        MultiRequest(Seq(
-          CreateOp(ControllerZNode.path, ControllerZNode.encode(controllerId, timestamp), defaultAcls(ControllerZNode.path), CreateMode.EPHEMERAL),
-          SetDataOp(ControllerEpochZNode.path, ControllerEpochZNode.encode(newControllerEpoch), expectedControllerEpochZkVersion)))
-      )
+      val response = if (!force) {
+        retryRequestUntilConnected(
+          MultiRequest(Seq(
+            SetDataOp(ControllerEpochZNode.path, ControllerEpochZNode.encode(newControllerEpoch), expectedControllerEpochZkVersion),
+            CreateOp(ControllerZNode.path, ControllerZNode.encode(controllerId, timestamp), defaultAcls(ControllerZNode.path), CreateMode.EPHEMERAL)))
+        )
+      } else {
+        retryRequestUntilConnected(
+          MultiRequest(Seq(
+            SetDataOp(ControllerEpochZNode.path, ControllerEpochZNode.encode(newControllerEpoch), ZkVersion.MatchAnyVersion),
+            DeleteOp(ControllerZNode.path, ZkVersion.MatchAnyVersion),
+            CreateOp(ControllerZNode.path, ControllerZNode.encode(controllerId, timestamp), defaultAcls(ControllerZNode.path), CreateMode.PERSISTENT)))
+        )
+      }
       response.resultCode match {
         case Code.NODEEXISTS | Code.BADVERSION => checkControllerAndEpoch()
         case Code.OK =>
-          val setDataResult = response.zkOpResults(1).rawOpResult.asInstanceOf[SetDataResult]
+          val setDataResult = response.zkOpResults(0).rawOpResult.asInstanceOf[SetDataResult]
           (newControllerEpoch, setDataResult.getStat.getVersion)
         case code => throw KeeperException.create(code)
       }
@@ -340,6 +349,24 @@ class KafkaZkClient private[zk] (zooKeeperClient: ZooKeeperClient, isSecure: Boo
     }
   }
 
+  def getEntitiesConfigs(rootEntityType: String, sanitizedEntityNames: Set[String]): Map[String, Properties] = {
+    val getDataRequests: Seq[GetDataRequest] = sanitizedEntityNames.map { entityName =>
+      GetDataRequest(ConfigEntityZNode.path(rootEntityType, entityName), Some(entityName))
+    }.toSeq
+
+    val getDataResponses = retryRequestsUntilConnected(getDataRequests)
+    getDataResponses.map { response =>
+      val entityName = response.ctx.get.asInstanceOf[String]
+      response.resultCode match {
+        case Code.OK =>
+          entityName -> ConfigEntityZNode.decode(response.data)
+        case Code.NONODE =>
+          entityName -> new Properties()
+        case _ => throw response.resultException.get
+      }
+    }.toMap
+  }
+
   /**
    * Sets or creates the entity znode path with the given configs depending
    * on whether it already exists or not.
@@ -423,8 +450,12 @@ class KafkaZkClient private[zk] (zooKeeperClient: ZooKeeperClient, isSecure: Boo
     * Gets all brokers with broker epoch in the cluster.
     * @return map of broker to epoch in the cluster.
     */
-  def getAllBrokerAndEpochsInCluster: Map[Broker, Long] = {
-    val brokerIds = getSortedBrokerList
+  def getAllBrokerAndEpochsInCluster(filterBrokerIds: Seq[Int] = Seq.empty): Map[Broker, Long] = {
+    val brokerIds = if (filterBrokerIds.isEmpty) {
+      getSortedBrokerList
+    } else {
+      filterBrokerIds
+    }
     val getDataRequests = brokerIds.map(brokerId => GetDataRequest(BrokerIdZNode.path(brokerId), ctx = Some(brokerId)))
     val getDataResponses = retryRequestsUntilConnected(getDataRequests)
     getDataResponses.flatMap { getDataResponse =>
