@@ -46,9 +46,15 @@ public class KRaftMigrationDriver {
             removed.removeAll(updatedBrokerIds);
 
             System.err.println("Brokers added: " + added + ", removed: " + removed);
-            added.forEach(brokerId -> System.err.println(client.readBrokerRegistration(brokerId)));
+            added.forEach(brokerId -> {
+                client.addZkBroker(brokerId);
+                System.err.println(client.readBrokerRegistration(brokerId));
+            });
+            removed.forEach(client::removeZkBroker);
+
             brokerIds.addAll(added);
             brokerIds.removeAll(removed);
+
             // TODO integrate with ClusterControlManager
         }
     }

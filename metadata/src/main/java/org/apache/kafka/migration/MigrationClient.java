@@ -18,6 +18,10 @@ public interface MigrationClient {
 
     void watchZkBrokerRegistrations(BrokerRegistrationListener listener);
 
+    void addZkBroker(int brokerId);
+
+    void removeZkBroker(int brokerId);
+
     Optional<BrokerRegistration> readBrokerRegistration(int brokerId);
 
     Set<Integer> readBrokerIds();
