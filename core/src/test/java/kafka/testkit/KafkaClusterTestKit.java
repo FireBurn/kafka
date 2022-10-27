@@ -46,6 +46,7 @@ import org.apache.kafka.server.fault.MockFaultHandler;
 import org.apache.kafka.test.TestUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import scala.None;
 import scala.Option;
 import scala.collection.JavaConverters;
 
@@ -204,7 +205,8 @@ public class KafkaClusterTestKit implements AutoCloseable {
                         raftManager.apiVersions(),
                         bootstrapMetadata,
                         metadataFaultHandler,
-                        fatalFaultHandler
+                        fatalFaultHandler,
+                        Option.empty()
                     );
                     controllers.put(node.id(), controller);
                     controller.socketServerFirstBoundPortFuture().whenComplete((port, e) -> {

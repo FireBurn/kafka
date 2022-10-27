@@ -18,15 +18,15 @@
 package kafka.cluster
 
 import java.util
-
 import kafka.common.BrokerEndPointNotAvailableException
 import kafka.server.KafkaConfig
 import org.apache.kafka.common.feature.{Features, SupportedVersionRange}
 import org.apache.kafka.common.feature.Features._
-import org.apache.kafka.common.{ClusterResource, Endpoint, Node}
+import org.apache.kafka.common.{ClusterResource, Endpoint, Node, Uuid}
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.server.authorizer.AuthorizerServerInfo
+import org.apache.kafka.server.common.MetadataVersion
 
 import scala.collection.Seq
 import scala.jdk.CollectionConverters._
@@ -39,9 +39,11 @@ object Broker {
                                          earlyStartListeners: util.Set[String]) extends AuthorizerServerInfo
 
   def apply(id: Int, endPoints: Seq[EndPoint], rack: Option[String]): Broker = {
-    new Broker(id, endPoints, rack, emptySupportedFeatures)
+    new Broker(id, endPoints, rack, emptySupportedFeatures, None)
   }
 }
+
+case class BrokerMigration(clusterId: Uuid, metadataVersion: MetadataVersion, enabled: Boolean)
 
 /**
  * A Kafka broker.
@@ -51,7 +53,8 @@ object Broker {
  * @param rack        an optional rack
  * @param features    supported features
  */
-case class Broker(id: Int, endPoints: Seq[EndPoint], rack: Option[String], features: Features[SupportedVersionRange]) {
+case class Broker(id: Int, endPoints: Seq[EndPoint], rack: Option[String], features: Features[SupportedVersionRange],
+                  migration: Option[BrokerMigration]) {
 
   private val endPointsMap = endPoints.map { endPoint =>
     endPoint.listenerName -> endPoint
@@ -64,7 +67,7 @@ case class Broker(id: Int, endPoints: Seq[EndPoint], rack: Option[String], featu
     s"$id : ${endPointsMap.values.mkString("(",",",")")} : ${rack.orNull} : $features"
 
   def this(id: Int, host: String, port: Int, listenerName: ListenerName, protocol: SecurityProtocol) = {
-    this(id, Seq(EndPoint(host, port, listenerName, protocol)), None, emptySupportedFeatures)
+    this(id, Seq(EndPoint(host, port, listenerName, protocol)), None, emptySupportedFeatures, None)
   }
 
   def this(bep: BrokerEndPoint, listenerName: ListenerName, protocol: SecurityProtocol) = {

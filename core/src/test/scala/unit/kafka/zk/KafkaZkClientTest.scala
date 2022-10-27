@@ -810,7 +810,8 @@ class KafkaZkClientTest extends QuorumTestHarness {
         id,
         Seq(new EndPoint(host, port, ListenerName.forSecurityProtocol(securityProtocol), securityProtocol)),
         rack = rack,
-        features = features),
+        features = features,
+        migration = None),
       MetadataVersion.latest, jmxPort = port + 10)
 
   @Test

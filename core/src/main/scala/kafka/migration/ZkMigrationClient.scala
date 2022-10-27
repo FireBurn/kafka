@@ -1,82 +1,52 @@
 package kafka.migration
 
-import kafka.cluster.Broker
-import kafka.controller.{ControllerChannelManager, StateChangeLogger}
-import kafka.coordinator.transaction.ZkProducerIdManager
+import kafka.api.LeaderAndIsr
+import kafka.cluster.{Broker, EndPoint}
+import kafka.controller.{ControllerChannelManager, LeaderIsrAndControllerEpoch}
 import kafka.migration.ZkMigrationClient.brokerToBrokerRegistration
-import kafka.server.{ConfigEntityName, ConfigType, KafkaConfig, ZkAdminManager}
+import kafka.server.{ConfigEntityName, ConfigType, ZkAdminManager}
 import kafka.utils.Logging
-import kafka.zk.{AdminZkClient, BrokerIdZNode, BrokerIdsZNode, KafkaZkClient, ProducerIdBlockZNode}
 import kafka.zk.TopicZNode.TopicIdReplicaAssignment
-import kafka.zookeeper.{ZNodeChangeHandler, ZNodeChildChangeHandler}
-import org.apache.kafka.common.{Endpoint, Uuid}
+import kafka.zk._
+import kafka.zookeeper._
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.metadata.ClientQuotaRecord.EntityData
-import org.apache.kafka.common.metadata.{ClientQuotaRecord, ConfigRecord, PartitionRecord, ProducerIdsRecord, TopicRecord}
-import org.apache.kafka.common.metrics.Metrics
-import org.apache.kafka.common.requests.{AbstractResponse, UpdateMetadataRequest, UpdateMetadataResponse}
-import org.apache.kafka.common.utils.Time
-import org.apache.kafka.metadata.{BrokerRegistration, VersionRange}
-import org.apache.kafka.migration.{KRaftMigrationDriver, MigrationClient}
+import org.apache.kafka.common.metadata._
+import org.apache.kafka.common.requests.{AbstractControlRequest, AbstractResponse}
+import org.apache.kafka.common.{Endpoint, TopicPartition, Uuid}
+import org.apache.kafka.metadata.{BrokerRegistration, PartitionRegistration, VersionRange}
+import org.apache.kafka.migration._
 import org.apache.kafka.server.common.{ApiMessageAndVersion, MetadataVersion}
-import org.apache.zookeeper.client.ZKClientConfig
+import org.apache.zookeeper.CreateMode
 
 import java.util
-import java.util.{Collections, Optional, Properties}
 import java.util.function.Consumer
+import java.util.{Collections, Optional}
+import scala.collection.Seq
 import scala.jdk.CollectionConverters._
+import scala.jdk.OptionConverters._
 
 object ZkMigrationClient {
-  def brokerToBrokerRegistration(broker: Broker, epoch: Long): BrokerRegistration = {
-      new BrokerRegistration(broker.id, epoch, Uuid.ZERO_UUID,
+  def brokerToBrokerRegistration(broker: Broker, epoch: Long): ZkBrokerRegistration = {
+      val registration = new BrokerRegistration(broker.id, epoch, Uuid.ZERO_UUID,
         Collections.emptyList[Endpoint], Collections.emptyMap[String, VersionRange],
         Optional.empty(), false, false)
-  }
-
-  def main(args: Array[String]): Unit = {
-    val props = new Properties()
-    props.put("zookeeper.connect", "localhost:2181")
-    val config = KafkaConfig.fromProps(props)
-    val logger = new StateChangeLogger(-1, inControllerContext = false, None)
-    val zkClient = KafkaZkClient("localhost:2181", false, 60000, 30000, 10, Time.SYSTEM, "migration", new ZKClientConfig())
-    val channelManager = new ControllerChannelManager(() => -1, config, Time.SYSTEM, new Metrics(), logger)
-    val migrationSupport = new ZkMigrationClient(zkClient, channelManager)
-    val driver = new KRaftMigrationDriver(migrationSupport)
-    driver.beginMigration()
-
-    /*migrationSupport.claimControllerLeadership()
-    migrationSupport.migrateTopics(MetadataVersion.latest(), batch => {
-      System.err.println("")
-      batch.forEach(record => System.err.println(record))
-    })*/
+      new ZkBrokerRegistration(registration, null, null, false)
   }
 }
 
 class ZkMigrationClient(zkClient: KafkaZkClient,
                         controllerChannelManager: ControllerChannelManager) extends MigrationClient with Logging {
-  def claimControllerLeadership(): Unit = {
-    val (epoch, epochZkVersion) = zkClient.registerControllerAndIncrementControllerEpoch(3000, force=true)
-    System.err.println(epoch)
-    System.err.println(epochZkVersion)
-  }
 
-  def sendUMR(): Unit = {
-    val (controllerEpoch, epochZkVersion) = zkClient.registerControllerAndIncrementControllerEpoch(3000, force=true)
-    Thread.sleep(5000)
-    val brokersAndEpochs = zkClient.getAllBrokerAndEpochsInCluster()
-    brokersAndEpochs.foreach { case (broker, epoch) =>
-      System.err.println(s"Sending (empty) UMR to ${broker.id}")
-      val updateMetadataRequestBuilder = new UpdateMetadataRequest.Builder(7,
-        3000, controllerEpoch, epoch, Collections.emptyList(), Collections.emptyList(), Collections.emptyMap())
-      controllerChannelManager.sendRequest(broker.id, updateMetadataRequestBuilder, (r: AbstractResponse) => {
-        val updateMetadataResponse = r.asInstanceOf[UpdateMetadataResponse]
-        System.err.println(updateMetadataResponse)
-      })
-    }
+  def claimControllerLeadership(kraftControllerId: Int): ZkControllerState = {
+    // TODO need to write the KRaft controller epoch instead of incrementing here.
+    val (epoch, epochZkVersion) = zkClient.registerControllerAndIncrementControllerEpoch(kraftControllerId, force=true)
+    new ZkControllerState(kraftControllerId, epoch, epochZkVersion)
   }
 
   def migrateTopics(metadataVersion: MetadataVersion,
-                    recordConsumer: Consumer[util.List[ApiMessageAndVersion]]): Unit = {
+                    recordConsumer: Consumer[util.List[ApiMessageAndVersion]],
+                    brokerIdConsumer: Consumer[Integer]): Unit = {
     val topics = zkClient.getAllTopicsInCluster()
     val topicConfigs = zkClient.getEntitiesConfigs(ConfigType.Topic, topics)
     val replicaAssignmentAndTopicIds = zkClient.getReplicaAssignmentAndTopicIdForTopics(topics)
@@ -89,6 +59,9 @@ class ZkMigrationClient(zkClient: KafkaZkClient,
         .setTopicId(topicIdOpt.get), TopicRecord.HIGHEST_SUPPORTED_VERSION))
 
       assignments.foreach { case (topicPartition, replicaAssignment) =>
+        replicaAssignment.replicas.foreach(brokerIdConsumer.accept(_))
+        replicaAssignment.addingReplicas.foreach(brokerIdConsumer.accept(_))
+
         val leaderIsrAndEpoch = leaderIsrAndControllerEpochs(topicPartition)
         topicBatch.add(new ApiMessageAndVersion(new PartitionRecord()
           .setTopicId(topicIdOpt.get)
@@ -180,8 +153,8 @@ class ZkMigrationClient(zkClient: KafkaZkClient,
     migrateEntityType(ConfigType.Ip)
   }
 
-  def migrateNextProducerId(metadataVersion: MetadataVersion,
-                            recordConsumer: Consumer[util.List[ApiMessageAndVersion]]): Unit = {
+  def migrateProducerId(metadataVersion: MetadataVersion,
+                        recordConsumer: Consumer[util.List[ApiMessageAndVersion]]): Unit = {
     val (dataOpt, _) = zkClient.getDataAndVersion(ProducerIdBlockZNode.path)
     dataOpt match {
       case Some(data) =>
@@ -194,11 +167,11 @@ class ZkMigrationClient(zkClient: KafkaZkClient,
     }
   }
 
-  override def readAllMetadata(batchConsumer: Consumer[util.List[ApiMessageAndVersion]]): Unit = {
-    migrateTopics(MetadataVersion.latest(), batchConsumer)
+  override def readAllMetadata(batchConsumer: Consumer[util.List[ApiMessageAndVersion]], brokerIdConsumer: Consumer[Integer]): Unit = {
+    migrateTopics(MetadataVersion.latest(), batchConsumer, brokerIdConsumer)
     migrateBrokerConfigs(MetadataVersion.latest(), batchConsumer)
     migrateClientQuotas(MetadataVersion.latest(), batchConsumer)
-    migrateNextProducerId(MetadataVersion.latest(), batchConsumer)
+    migrateProducerId(MetadataVersion.latest(), batchConsumer)
   }
 
   override def watchZkBrokerRegistrations(listener: MigrationClient.BrokerRegistrationListener): Unit = {
@@ -227,7 +200,7 @@ class ZkMigrationClient(zkClient: KafkaZkClient,
     listener.onBrokersChange()
   }
 
-  override def readBrokerRegistration(brokerId: Int): Optional[BrokerRegistration] = {
+  override def readBrokerRegistration(brokerId: Int): Optional[ZkBrokerRegistration] = {
     val brokerAndEpoch = zkClient.getAllBrokerAndEpochsInCluster(Seq(brokerId))
     if (brokerAndEpoch.isEmpty) {
       Optional.empty()
@@ -247,5 +220,130 @@ class ZkMigrationClient(zkClient: KafkaZkClient,
 
   override def removeZkBroker(brokerId: Int): Unit = {
     controllerChannelManager.removeBroker(brokerId)
+  }
+
+  override def getOrCreateMigrationRecoveryState(initialState: MigrationRecoveryState): MigrationRecoveryState = {
+    zkClient.getOrCreateMigrationState(initialState)
+  }
+
+  override def setMigrationRecoveryState(state: MigrationRecoveryState): MigrationRecoveryState = {
+    zkClient.updateMigrationState(state)
+  }
+
+  override def sendRequestToBroker(brokerId: Int,
+                                   request: AbstractControlRequest.Builder[_ <: AbstractControlRequest],
+                                   callback: Consumer[AbstractResponse]): Unit = {
+    controllerChannelManager.sendRequest(brokerId, request, callback.accept)
+  }
+
+  override def createTopic(topicName: String, topicId: Uuid, state: MigrationRecoveryState): MigrationRecoveryState = {
+    val createTopicZNode = {
+      val path = TopicZNode.path(topicName)
+      CreateRequest(
+        path,
+        TopicZNode.encode(Some(topicId), Map.empty), // TODO write assignments
+        zkClient.defaultAcls(path),
+        CreateMode.PERSISTENT)
+    }
+    val createPartitionsZNode = {
+      val path = TopicPartitionsZNode.path(topicName)
+      CreateRequest(
+        path,
+        null,
+        zkClient.defaultAcls(path),
+        CreateMode.PERSISTENT)
+    }
+
+    val (migrationZkVersion, responses) = zkClient.retryMigrationRequestsUntilConnected(Seq(createTopicZNode, createPartitionsZNode), state.controllerZkVersion(), state)
+    responses.foreach(System.err.println)
+    state.withZkVersion(migrationZkVersion)
+  }
+
+  private def createTopicPartition(topicPartition: TopicPartition): CreateRequest = {
+    val path = TopicPartitionZNode.path(topicPartition)
+    CreateRequest(path, null, zkClient.defaultAcls(path), CreateMode.PERSISTENT, Some(topicPartition))
+  }
+
+  private def createTopicPartitionState(topicPartition: TopicPartition, partitionRegistration: PartitionRegistration, controllerEpoch: Int): CreateRequest = {
+    val path = TopicPartitionStateZNode.path(topicPartition)
+    val data = TopicPartitionStateZNode.encode(LeaderIsrAndControllerEpoch(new LeaderAndIsr(
+      partitionRegistration.leader,
+      partitionRegistration.leaderEpoch,
+      partitionRegistration.isr.toList,
+      partitionRegistration.leaderRecoveryState,
+      partitionRegistration.partitionEpoch), controllerEpoch))
+    CreateRequest(path, data, zkClient.defaultAcls(path), CreateMode.PERSISTENT, Some(topicPartition))
+  }
+
+  private def updateTopicPartitionState(topicPartition: TopicPartition, partitionRegistration: PartitionRegistration, controllerEpoch: Int): SetDataRequest = {
+    val path = TopicPartitionStateZNode.path(topicPartition)
+    val data = TopicPartitionStateZNode.encode(LeaderIsrAndControllerEpoch(new LeaderAndIsr(
+      partitionRegistration.leader,
+      partitionRegistration.leaderEpoch,
+      partitionRegistration.isr.toList,
+      partitionRegistration.leaderRecoveryState,
+      partitionRegistration.partitionEpoch), controllerEpoch))
+    SetDataRequest(path, data, ZkVersion.MatchAnyVersion, Some(topicPartition)) // TODO safe to use unconditional update here?
+  }
+
+  override def updateTopicPartitions(topicPartitions: util.Map[String, util.Map[Integer, PartitionRegistration]],
+                                     state: MigrationRecoveryState, create: Boolean): MigrationRecoveryState = {
+    val requests = topicPartitions.asScala.flatMap { case (topicName, partitionRegistrations) =>
+      partitionRegistrations.asScala.flatMap { case (partitionId, partitionRegistration) =>
+        val topicPartition = new TopicPartition(topicName, partitionId)
+        if (create) {
+          Seq(
+            createTopicPartition(topicPartition),
+            createTopicPartitionState(topicPartition, partitionRegistration, state.kraftControllerEpoch())
+          )
+        } else {
+          Seq(updateTopicPartitionState(topicPartition, partitionRegistration, state.kraftControllerEpoch()))
+        }
+      }
+    }
+    if (requests.isEmpty) {
+      state
+    } else {
+      val (migrationZkVersion, responses) = zkClient.retryMigrationRequestsUntilConnected(requests.toSeq, state.controllerZkVersion(), state)
+      responses.foreach(System.err.println)
+      state.withZkVersion(migrationZkVersion)
+    }
+  }
+
+  override def createKRaftBroker(brokerId: Int, brokerRegistration: BrokerRegistration, state: MigrationRecoveryState): MigrationRecoveryState = {
+    val brokerInfo = BrokerInfo(
+      Broker(
+        id = brokerId,
+        endPoints = brokerRegistration.listeners().values().asScala.map(EndPoint.fromJava).toSeq,
+        rack = brokerRegistration.rack().toScala),
+      MetadataVersion.latest(), // TODO ???
+      -1
+    )
+    val req = CreateRequest(brokerInfo.path, brokerInfo.toJsonBytes, zkClient.defaultAcls(brokerInfo.path), CreateMode.PERSISTENT)
+    val (migrationZkVersion, responses) = zkClient.retryMigrationRequestsUntilConnected(Seq(req), state.controllerZkVersion(), state)
+    responses.foreach(System.err.println)
+    state.withZkVersion(migrationZkVersion)
+  }
+
+  override def updateKRaftBroker(brokerId: Int, brokerRegistration: BrokerRegistration, state: MigrationRecoveryState): MigrationRecoveryState = {
+    val brokerInfo = BrokerInfo(
+      Broker(
+        id = brokerId,
+        endPoints = brokerRegistration.listeners().values().asScala.map(EndPoint.fromJava).toSeq,
+        rack = brokerRegistration.rack().toScala),
+      MetadataVersion.latest(), // TODO ???
+      -1
+    )
+    val req = SetDataRequest(BrokerIdZNode.path(brokerId), brokerInfo.toJsonBytes, ZkVersion.MatchAnyVersion)
+    val (migrationZkVersion, responses) = zkClient.retryMigrationRequestsUntilConnected(Seq(req), state.controllerZkVersion(), state)
+    responses.foreach(System.err.println)
+    state.withZkVersion(migrationZkVersion)
+  }
+
+  override def removeKRaftBroker(brokerId: Int, state: MigrationRecoveryState): MigrationRecoveryState = {
+    val req = DeleteRequest(BrokerIdZNode.path(brokerId), ZkVersion.MatchAnyVersion)
+    val (migrationZkVersion, responses) = zkClient.retryMigrationRequestsUntilConnected(Seq(req), state.controllerZkVersion(), state)
+    responses.foreach(System.err.println)
+    state.withZkVersion(migrationZkVersion)
   }
 }

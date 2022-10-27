@@ -19,11 +19,10 @@ package kafka.zk
 import java.nio.charset.StandardCharsets.UTF_8
 import java.util
 import java.util.Properties
-
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.core.JsonProcessingException
 import kafka.api.LeaderAndIsr
-import kafka.cluster.{Broker, EndPoint}
+import kafka.cluster.{Broker, BrokerMigration, EndPoint}
 import kafka.common.{NotificationHandler, ZkNodeChangeNotificationListener}
 import kafka.controller.{IsrChangeNotificationHandler, LeaderIsrAndControllerEpoch, ReplicaAssignment}
 import kafka.security.authorizer.AclAuthorizer.VersionedAcls
@@ -41,8 +40,9 @@ import org.apache.kafka.common.security.token.delegation.{DelegationToken, Token
 import org.apache.kafka.common.utils.{SecurityUtils, Time}
 import org.apache.kafka.common.{KafkaException, TopicPartition, Uuid}
 import org.apache.kafka.metadata.LeaderRecoveryState
+import org.apache.kafka.migration.MigrationRecoveryState
 import org.apache.kafka.server.common.{MetadataVersion, ProducerIdsBlock}
-import org.apache.kafka.server.common.MetadataVersion.{IBP_0_10_0_IV1, IBP_2_7_IV0}
+import org.apache.kafka.server.common.MetadataVersion.{IBP_0_10_0_IV1, IBP_2_7_IV0, IBP_3_4_IV0}
 import org.apache.zookeeper.ZooDefs
 import org.apache.zookeeper.data.{ACL, Stat}
 
@@ -86,6 +86,7 @@ object BrokerIdsZNode {
 object BrokerInfo {
 
   /**
+   * - Create a broker info with v6 json format if metadataVersion is 3.4 or above
    * - Create a broker info with v5 json format if the metadataVersion is 2.7.x or above.
    * - Create a broker info with v4 json format (which includes multiple endpoints and rack) if
    *   the metadataVersion is 0.10.0.X or above but lesser than 2.7.x.
@@ -99,7 +100,9 @@ object BrokerInfo {
    */
   def apply(broker: Broker, metadataVersion: MetadataVersion, jmxPort: Int): BrokerInfo = {
     val version = {
-      if (metadataVersion.isAtLeast(IBP_2_7_IV0))
+      if (metadataVersion.isAtLeast(IBP_3_4_IV0))
+        6
+      else if (metadataVersion.isAtLeast(IBP_2_7_IV0))
         5
       else if (metadataVersion.isAtLeast(IBP_0_10_0_IV1))
         4
@@ -135,7 +138,7 @@ object BrokerIdZNode {
    * The JSON format includes a top level host and port for compatibility with older clients.
    */
   def encode(version: Int, host: String, port: Int, advertisedEndpoints: Seq[EndPoint], jmxPort: Int,
-             rack: Option[String], features: Features[SupportedVersionRange]): Array[Byte] = {
+             rack: Option[String], features: Features[SupportedVersionRange], migration: Option[BrokerMigration]): Array[Byte] = {
     val jsonMap = collection.mutable.Map(VersionKey -> version,
       HostKey -> host,
       PortKey -> port,
@@ -154,6 +157,14 @@ object BrokerIdZNode {
     if (version >= 5) {
       jsonMap += (FeaturesKey -> features.toMap)
     }
+
+    if (version >= 6) {
+      migration.foreach { m => jsonMap.put("migration", Map(
+        "clusterId" -> m.clusterId.toString,
+        "ibp" -> m.metadataVersion.toString,
+        "enabled" -> m.enabled
+      ))}
+    }
     Json.encodeAsBytes(jsonMap.asJava)
   }
 
@@ -165,7 +176,7 @@ object BrokerIdZNode {
     val plaintextEndpoint = broker.endPoints.find(_.securityProtocol == SecurityProtocol.PLAINTEXT).getOrElse(
       new EndPoint(null, -1, null, null))
     encode(brokerInfo.version, plaintextEndpoint.host, plaintextEndpoint.port, broker.endPoints, brokerInfo.jmxPort,
-      broker.rack, broker.features)
+      broker.rack, broker.features, broker.migration)
   }
 
   def featuresAsJavaMap(brokerInfo: JsonObject): util.Map[String, util.Map[String, java.lang.Short]] = {
@@ -238,6 +249,10 @@ object BrokerIdZNode {
     *   "rack":"dc1",
     *   "features": {"feature": {"min_version":1, "first_active_version":2, "max_version":3}}
     * }
+   *
+   * Version 6 (current) JSON schema
+   *
+   * TODO
     */
   def decode(id: Int, jsonBytes: Array[Byte]): BrokerInfo = {
     Json.tryParseBytes(jsonBytes) match {
@@ -268,8 +283,22 @@ object BrokerIdZNode {
 
         val rack = brokerInfo.get(RackKey).flatMap(_.to[Option[String]])
         val features = featuresAsJavaMap(brokerInfo)
+
+        val migrationOpt = if (version < 6) {
+          None
+        } else {
+          brokerInfo.get("migration").map { node =>
+            val migrationObj = node.asJsonObject
+            BrokerMigration(
+              Uuid.fromString(migrationObj("clusterId").to[String]),
+              MetadataVersion.fromVersionString(migrationObj("ibp").to[String]),
+              migrationObj("enabled").to[Boolean]
+            )
+          }
+        }
+
         BrokerInfo(
-          Broker(id, endpoints, rack, fromSupportedFeaturesMap(features)), version, jmxPort)
+          Broker(id, endpoints, rack, fromSupportedFeaturesMap(features), migrationOpt), version, jmxPort)
       case Left(e) =>
         throw new KafkaException(s"Failed to parse ZooKeeper registration for broker $id: " +
           s"${new String(jsonBytes, UTF_8)}", e)
@@ -1019,6 +1048,38 @@ object FeatureZNode {
   }
 }
 
+object MigrationZNode {
+  val path = "/migration"
+
+  def encode(migration: MigrationRecoveryState): Array[Byte] = {
+    val jsonMap = Map(
+      "version" -> 0,
+      "kraft_controller_id" -> migration.kraftControllerId(),
+      "kraft_controller_epoch" -> migration.kraftControllerEpoch(),
+      "kraft_metadata_offset" -> migration.kraftMetadataOffset(),
+      "kraft_metadata_epoch" -> migration.kraftMetadataEpoch(),
+      "last_update_time_ms" -> migration.lastUpdatedTimeMs()
+    )
+    Json.encodeAsBytes(jsonMap.asJava)
+  }
+
+  def decode(bytes: Array[Byte], zkVersion: Int): MigrationRecoveryState = {
+    val jsonDataAsString = bytes.map(_.toChar).mkString
+    Json.parseBytes(bytes).map(_.asJsonObject).flatMap { js =>
+      val version = js("version").to[Int]
+      if (version != 0) {
+        throw new KafkaException(s"Encountered unknown version $version when parsing migration json $jsonDataAsString")
+      }
+      val controllerId = js("kraft_controller_id").to[Int]
+      val controllerEpoch = js("kraft_controller_epoch").to[Int]
+      val metadataOffset = js("kraft_metadata_offset").to[Long]
+      val metadataEpoch = js("kraft_metadata_epoch").to[Long]
+      val lastUpdateMs = js("last_update_time_ms").to[Long]
+      Some(new MigrationRecoveryState(controllerId, controllerEpoch, metadataOffset, metadataEpoch, lastUpdateMs, zkVersion, -2))
+    }.getOrElse(throw new KafkaException(s"Failed to parse the migration json $jsonDataAsString"))
+  }
+}
+
 object ZkData {
 
   // Important: it is necessary to add any new top level Zookeeper path to the Seq
@@ -1032,7 +1093,8 @@ object ZkData {
     ProducerIdBlockZNode.path,
     LogDirEventNotificationZNode.path,
     DelegationTokenAuthZNode.path,
-    ExtendedAclZNode.path) ++ ZkAclStore.securePaths
+    ExtendedAclZNode.path,
+    MigrationZNode.path) ++ ZkAclStore.securePaths
 
   // These are persistent ZK paths that should exist on kafka broker startup.
   val PersistentZkPaths = Seq(
