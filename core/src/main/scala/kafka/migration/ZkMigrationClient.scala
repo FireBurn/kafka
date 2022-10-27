@@ -2,7 +2,7 @@ package kafka.migration
 
 import kafka.api.LeaderAndIsr
 import kafka.cluster.{Broker, EndPoint}
-import kafka.controller.{ControllerChannelManager, LeaderIsrAndControllerEpoch}
+import kafka.controller.{ControllerChannelManager, LeaderIsrAndControllerEpoch, ReplicaAssignment}
 import kafka.migration.ZkMigrationClient.brokerToBrokerRegistration
 import kafka.server.{ConfigEntityName, ConfigType, ZkAdminManager}
 import kafka.utils.Logging
@@ -236,12 +236,16 @@ class ZkMigrationClient(zkClient: KafkaZkClient,
     controllerChannelManager.sendRequest(brokerId, request, callback.accept)
   }
 
-  override def createTopic(topicName: String, topicId: Uuid, state: MigrationRecoveryState): MigrationRecoveryState = {
+  override def createTopic(topicName: String, topicId: Uuid, partitions: util.Map[Integer, PartitionRegistration], state: MigrationRecoveryState): MigrationRecoveryState = {
+    val assignments = partitions.asScala.map { case (partitionId, partition) =>
+      new TopicPartition(topicName, partitionId) -> ReplicaAssignment(partition.replicas, partition.addingReplicas, partition.removingReplicas)
+    }
+
     val createTopicZNode = {
       val path = TopicZNode.path(topicName)
       CreateRequest(
         path,
-        TopicZNode.encode(Some(topicId), Map.empty), // TODO write assignments
+        TopicZNode.encode(Some(topicId), assignments),
         zkClient.defaultAcls(path),
         CreateMode.PERSISTENT)
     }
@@ -254,7 +258,16 @@ class ZkMigrationClient(zkClient: KafkaZkClient,
         CreateMode.PERSISTENT)
     }
 
-    val (migrationZkVersion, responses) = zkClient.retryMigrationRequestsUntilConnected(Seq(createTopicZNode, createPartitionsZNode), state.controllerZkVersion(), state)
+    val createPartitionZNodeReqs = partitions.asScala.flatMap { case (partitionId, partition) =>
+      val topicPartition = new TopicPartition(topicName, partitionId)
+      Seq(
+        createTopicPartition(topicPartition),
+        createTopicPartitionState(topicPartition, partition, state.kraftControllerEpoch())
+      )
+    }
+
+    val requests = Seq(createTopicZNode, createPartitionsZNode) ++ createPartitionZNodeReqs
+    val (migrationZkVersion, responses) = zkClient.retryMigrationRequestsUntilConnected(requests, state.controllerZkVersion(), state)
     responses.foreach(System.err.println)
     state.withZkVersion(migrationZkVersion)
   }
@@ -287,18 +300,11 @@ class ZkMigrationClient(zkClient: KafkaZkClient,
   }
 
   override def updateTopicPartitions(topicPartitions: util.Map[String, util.Map[Integer, PartitionRegistration]],
-                                     state: MigrationRecoveryState, create: Boolean): MigrationRecoveryState = {
+                                     state: MigrationRecoveryState): MigrationRecoveryState = {
     val requests = topicPartitions.asScala.flatMap { case (topicName, partitionRegistrations) =>
       partitionRegistrations.asScala.flatMap { case (partitionId, partitionRegistration) =>
         val topicPartition = new TopicPartition(topicName, partitionId)
-        if (create) {
-          Seq(
-            createTopicPartition(topicPartition),
-            createTopicPartitionState(topicPartition, partitionRegistration, state.kraftControllerEpoch())
-          )
-        } else {
-          Seq(updateTopicPartitionState(topicPartition, partitionRegistration, state.kraftControllerEpoch()))
-        }
+        Seq(updateTopicPartitionState(topicPartition, partitionRegistration, state.kraftControllerEpoch()))
       }
     }
     if (requests.isEmpty) {

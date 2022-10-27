@@ -80,11 +80,10 @@ public class KRaftMigrationDriver {
                                 if (image.topics().getTopic(topicId) == null) {
                                     System.err.println("Creating topic " + topicDelta.name() + " in ZK");
                                     // TODO include assignment
-                                    apply(migrationState -> client.createTopic(topicDelta.name(), topicId, migrationState));
-                                    apply(migrationState -> client.updateTopicPartitions(Collections.singletonMap(topicDelta.name(), topicDelta.partitionChanges()), migrationState, true));
+                                    apply(migrationState -> client.createTopic(topicDelta.name(), topicId, topicDelta.partitionChanges(), migrationState));
                                 } else {
                                     System.err.println("Updating topic " + topicDelta.name() + " in ZK");
-                                    apply(migrationState -> client.updateTopicPartitions(Collections.singletonMap(topicDelta.name(), topicDelta.partitionChanges()), migrationState, false));
+                                    apply(migrationState -> client.updateTopicPartitions(Collections.singletonMap(topicDelta.name(), topicDelta.partitionChanges()), migrationState));
                                 }
                             });
                         }

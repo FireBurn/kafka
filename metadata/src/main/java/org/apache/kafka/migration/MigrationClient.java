@@ -38,9 +38,9 @@ public interface MigrationClient {
 
     MigrationRecoveryState setMigrationRecoveryState(MigrationRecoveryState initialState);
 
-    MigrationRecoveryState createTopic(String topicName, Uuid topicId, MigrationRecoveryState state);
+    MigrationRecoveryState createTopic(String topicName, Uuid topicId, Map<Integer, PartitionRegistration> topicPartitions, MigrationRecoveryState state);
 
-    MigrationRecoveryState updateTopicPartitions(Map<String, Map<Integer, PartitionRegistration>> topicPartitions, MigrationRecoveryState state, boolean create);
+    MigrationRecoveryState updateTopicPartitions(Map<String, Map<Integer, PartitionRegistration>> topicPartitions, MigrationRecoveryState state);
 
     MigrationRecoveryState createKRaftBroker(int brokerId, BrokerRegistration brokerRegistration, MigrationRecoveryState state);
 
